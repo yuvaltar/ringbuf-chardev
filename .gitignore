@@ -1,0 +1,14 @@
+# Kbuild output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+*.order
+*.symvers
+.tmp_versions/
+
+# User-space binaries
+/tests/test_ringbuf
+/tools/ringbufctl
