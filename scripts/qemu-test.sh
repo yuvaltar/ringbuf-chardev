@@ -32,6 +32,10 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 dmesg -n 1
+# Drop boot messages so the final check sees only what the module produced.
+# Under KVM with -cpu host the kernel can warn about the host CPU at boot
+# (e.g. "RETBleed: WARNING ..."), which has nothing to do with the driver.
+dmesg -c > /dev/null
 
 status=0
 fail() { echo "FAIL: $*"; status=1; }
