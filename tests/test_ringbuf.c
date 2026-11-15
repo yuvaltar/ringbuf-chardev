@@ -19,8 +19,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/userfaultfd.h>
 
 #include "ringbuf_ioctl.h"
 
@@ -598,6 +603,181 @@ static void test_open_count_tracks_descriptors(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Security requirements (SECURITY.md)                                      */
+
+static void on_sigusr1(int sig);
+
+/* SR-1: only root may open the device or read its counters. */
+static void test_unprivileged_access_is_denied(void)
+{
+	struct stat sb;
+	pid_t pid;
+	int status;
+
+	CHECK(stat(DEV0, &sb) == 0);
+	CHECK((sb.st_mode & 07777) == 0600 && sb.st_uid == 0);
+	CHECK(stat(SYSFS0 "bytes_written", &sb) == 0);
+	CHECK((sb.st_mode & 0777) == 0400);
+
+	pid = fork();
+	CHECK(pid >= 0);
+	if (pid == 0) {
+		/* Drop to nobody: this also drops every capability. */
+		if (setgid(65534) || setuid(65534))
+			_exit(10);
+		if (open(DEV0, O_RDONLY) >= 0 || errno != EACCES)
+			_exit(11);
+		if (open(DEV0, O_WRONLY) >= 0 || errno != EACCES)
+			_exit(12);
+		if (open(SYSFS0 "bytes_written", O_RDONLY) >= 0 || errno != EACCES)
+			_exit(13);
+		_exit(0);
+	}
+	CHECK(waitpid(pid, &status, 0) == pid);
+	CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+/* SR-2: CLEAR and RESIZE need write access; GET_STATS does not. */
+static void test_clear_and_resize_need_write_access(void)
+{
+	uint32_t cap = 8192;
+	int fd = open_fresh(0);
+	int ro = open(DEV0, O_RDONLY);
+
+	CHECK(fd >= 0 && ro >= 0);
+	CHECK(write_pattern(fd, 100, 0) == 100);
+
+	errno = 0;
+	CHECK(ioctl(ro, RINGBUF_IOC_CLEAR) == -1 && errno == EBADF);
+	errno = 0;
+	CHECK(ioctl(ro, RINGBUF_IOC_RESIZE, &cap) == -1 && errno == EBADF);
+	CHECK(stats(ro).used == 100 && stats(ro).capacity == CAP);
+
+	/* A read-only descriptor still drains the FIFO, as with a pipe. */
+	CHECK(read_and_verify(ro, 100, 0));
+	close(ro);
+	close(fd);
+}
+
+/*
+ * SR-5: a writer stalled inside copy_from_user() holds the device lock.
+ * Here it faults on a userfaultfd page that is resolved only at the end,
+ * standing in for slow FUSE or swap-backed memory. Meanwhile other tasks
+ * must be able to open, poll and close the device, and a stats request
+ * stuck behind the lock must be interruptible instead of hanging
+ * unkillably in D state.
+ */
+struct stall_probe {
+	pthread_t thread;
+	atomic_int stage;	/* 1 opened, 2 polled, 3 stats returned */
+	int stats_ret, stats_errno;
+	int fd;
+	unsigned char *src;
+	ssize_t wret;
+};
+
+static void *stalled_writer(void *arg)
+{
+	struct stall_probe *p = arg;
+
+	p->wret = write(p->fd, p->src, 64);	/* faults on the uffd page */
+	return NULL;
+}
+
+static void *stall_prober(void *arg)
+{
+	struct stall_probe *p = arg;
+	struct ringbuf_stats st;
+	int fd = open(DEV0, O_RDONLY | O_NONBLOCK);
+	struct pollfd pf = { .fd = fd, .events = POLLIN | POLLOUT };
+
+	atomic_store(&p->stage, 1);
+	poll(&pf, 1, 0);
+	atomic_store(&p->stage, 2);
+	errno = 0;
+	p->stats_ret = ioctl(fd, RINGBUF_IOC_GET_STATS, &st);
+	p->stats_errno = errno;
+	atomic_store(&p->stage, 3);
+	close(fd);
+	return NULL;
+}
+
+static bool wait_stage(atomic_int *stage, int want, int ms)
+{
+	for (long long end = now_ms() + ms; now_ms() < end; sleep_ms(5))
+		if (atomic_load(stage) >= want)
+			return true;
+	return false;
+}
+
+static void test_stalled_writer_does_not_block_others(void)
+{
+	struct sigaction sa = { .sa_handler = on_sigusr1 };
+	struct uffdio_api api = { .api = UFFD_API };
+	struct stall_probe probe = { 0 }, writer = { 0 };
+	struct uffdio_register reg;
+	struct uffdio_copy copy;
+	struct uffd_msg msg;
+	struct pollfd upf;
+	long pg = sysconf(_SC_PAGESIZE);
+	unsigned char *page, *data;
+	bool opened, polled, interrupted;
+	int uffd, fd = open_fresh(0);
+
+	CHECK(fd >= 0);
+	uffd = syscall(SYS_userfaultfd, O_CLOEXEC);
+	CHECK(uffd >= 0);
+	CHECK(ioctl(uffd, UFFDIO_API, &api) == 0);
+	page = mmap(NULL, pg, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(page != MAP_FAILED);
+	reg = (struct uffdio_register){
+		.range = { .start = (uintptr_t)page, .len = pg },
+		.mode = UFFDIO_REGISTER_MODE_MISSING,
+	};
+	CHECK(ioctl(uffd, UFFDIO_REGISTER, &reg) == 0);
+
+	/* Writer faults and stalls with the device lock held. */
+	writer.fd = fd;
+	writer.src = page;
+	pthread_create(&writer.thread, NULL, stalled_writer, &writer);
+	upf = (struct pollfd){ .fd = uffd, .events = POLLIN };
+	CHECK(poll(&upf, 1, 5000) == 1);
+	CHECK(read(uffd, &msg, sizeof(msg)) == sizeof(msg));
+	CHECK(msg.event == UFFD_EVENT_PAGEFAULT);
+
+	sigaction(SIGUSR1, &sa, NULL);		/* no SA_RESTART */
+	pthread_create(&probe.thread, NULL, stall_prober, &probe);
+	opened = wait_stage(&probe.stage, 1, 2000);
+	polled = wait_stage(&probe.stage, 2, 2000);
+	sleep_ms(50);				/* let it block on the lock */
+	for (int i = 0; i < 100 && atomic_load(&probe.stage) < 3; i++) {
+		pthread_kill(probe.thread, SIGUSR1);
+		sleep_ms(20);
+	}
+	interrupted = atomic_load(&probe.stage) == 3;
+
+	/* Resolve the fault with pattern bytes: the stalled write completes. */
+	data = malloc(pg);
+	fill(data, pg, 0);
+	copy = (struct uffdio_copy){ .dst = (uintptr_t)page, .src = (uintptr_t)data,
+				     .len = pg };
+	CHECK(ioctl(uffd, UFFDIO_COPY, &copy) == 0);
+	pthread_join(writer.thread, NULL);
+	pthread_join(probe.thread, NULL);
+	free(data);
+
+	CHECK(opened && polled);		/* open and poll did not wait */
+	CHECK(interrupted);			/* the lock wait was killable */
+	CHECK(probe.stats_ret == -1 && probe.stats_errno == EINTR);
+	CHECK(writer.wret == 64);
+	CHECK(read_and_verify(fd, 64, 0));
+	munmap(page, pg);
+	close(uffd);
+	close(fd);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Signals                                                                  */
 
 static void on_sigusr1(int sig)
@@ -922,6 +1102,9 @@ static const struct test tests[] = {
 	TEST(test_devices_are_independent),
 	TEST(test_sysfs_matches_ioctl),
 	TEST(test_open_count_tracks_descriptors),
+	TEST(test_unprivileged_access_is_denied),
+	TEST(test_clear_and_resize_need_write_access),
+	TEST(test_stalled_writer_does_not_block_others),
 	TEST(test_signal_interrupts_blocking_read),
 	TEST(test_signal_interrupts_blocking_write),
 	TEST(test_signal_after_partial_write_returns_count),

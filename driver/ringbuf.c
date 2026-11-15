@@ -10,10 +10,21 @@
  *  - O_NONBLOCK, poll/select/epoll and signal interruption are supported;
  *  - ioctl() reads statistics, clears and resizes the buffer, and the same
  *    counters are exported under /sys/class/ringbuf/ringbufN/.
+ *
+ * Security properties (see SECURITY.md for the threat model):
+ *  - device nodes are root-only (0600) and so are the sysfs counters (0400);
+ *  - CLEAR and RESIZE need a descriptor opened for writing;
+ *  - memory a user can make the driver allocate is charged to their memcg;
+ *  - cleared or freed buffers are zeroed, so old data cannot resurface;
+ *  - a task stalled inside a user copy while holding the lock (e.g. on a
+ *    userfaultfd or FUSE page) cannot make others sleep unkillably: open,
+ *    release and poll are lock-free and every other lock wait is
+ *    interruptible.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -41,9 +52,9 @@ MODULE_PARM_DESC(bufsize, "Initial capacity in bytes (16-1048576, default 4096)"
 
 struct ringbuf_dev {
 	/*
-	 * Protects all fields below. @count and @size are also read without
-	 * the lock in wait conditions, so they are updated with WRITE_ONCE();
-	 * every decision is re-checked under the lock afterwards.
+	 * Protects the fields below. @count and @size are also read without
+	 * the lock in wait conditions and poll, so they are updated with
+	 * WRITE_ONCE(); every decision is re-checked under the lock afterwards.
 	 */
 	struct mutex lock;
 	char *buf;
@@ -53,7 +64,8 @@ struct ringbuf_dev {
 	size_t count;			/* bytes stored */
 	u64 bytes_written;
 	u64 bytes_read;
-	unsigned int open_count;
+
+	atomic_t open_count;		/* lock-free: open/release never block */
 
 	wait_queue_head_t readq;	/* readers waiting for data */
 	wait_queue_head_t writeq;	/* writers waiting for space */
@@ -152,28 +164,49 @@ static int rb_copy_in(struct ringbuf_dev *rb, const char __user *ubuf,
 	return 0;
 }
 
-static void rb_get_stats(struct ringbuf_dev *rb, struct ringbuf_stats *st)
+static int rb_get_stats(struct ringbuf_dev *rb, struct ringbuf_stats *st)
 {
 	memset(st, 0, sizeof(*st));	/* no stack bytes leak through padding */
-	mutex_lock(&rb->lock);
+	if (mutex_lock_interruptible(&rb->lock))
+		return -ERESTARTSYS;
 	st->capacity = rb->size;
 	st->used = rb->count;
 	st->bytes_written = rb->bytes_written;
 	st->bytes_read = rb->bytes_read;
-	st->open_count = rb->open_count;
+	st->open_count = atomic_read(&rb->open_count);
 	mutex_unlock(&rb->lock);
+	return 0;
+}
+
+static int rb_clear(struct ringbuf_dev *rb)
+{
+	if (mutex_lock_interruptible(&rb->lock))
+		return -ERESTARTSYS;
+	/* Wipe the contents too, not just the indexes (no data remanence). */
+	memset(rb->buf, 0, rb->size);
+	rb->head = 0;
+	rb->tail = 0;
+	WRITE_ONCE(rb->count, 0);
+	rb->bytes_written = 0;
+	rb->bytes_read = 0;
+	mutex_unlock(&rb->lock);
+	wake_up_interruptible_poll(&rb->writeq, EPOLLOUT | EPOLLWRNORM);
+	return 0;
 }
 
 static int rb_resize(struct ringbuf_dev *rb, u32 newsize)
 {
-	size_t first;
+	size_t first, oldsize;
 	char *nbuf, *old;
 
 	if (newsize < RINGBUF_MIN_SIZE || newsize > RINGBUF_MAX_SIZE)
 		return -EINVAL;
 
-	/* Allocate before taking the lock: the allocation may sleep. */
-	nbuf = kvzalloc(newsize, GFP_KERNEL);
+	/*
+	 * Allocate before taking the lock: the allocation may sleep. Any
+	 * writer can trigger it, so charge it to the caller's memory cgroup.
+	 */
+	nbuf = kvzalloc(newsize, GFP_KERNEL_ACCOUNT);
 	if (!nbuf)
 		return -ENOMEM;
 
@@ -193,13 +226,14 @@ static int rb_resize(struct ringbuf_dev *rb, u32 newsize)
 	memcpy(nbuf + first, rb->buf, rb->count - first);
 
 	old = rb->buf;
+	oldsize = rb->size;
 	rb->buf = nbuf;
 	rb->tail = 0;
 	rb->head = rb->count % newsize;
 	WRITE_ONCE(rb->size, newsize);
 	mutex_unlock(&rb->lock);
 
-	kvfree(old);
+	kvfree_sensitive(old, oldsize);
 	/* More room, or a lower atomic-write limit: blocked writers re-check. */
 	wake_up_interruptible_poll(&rb->writeq, EPOLLOUT | EPOLLWRNORM);
 	return 0;
@@ -216,10 +250,7 @@ static int ringbuf_open(struct inode *inode, struct file *filp)
 	/* A FIFO has no file position: lseek/pread/pwrite get -ESPIPE. */
 	stream_open(inode, filp);
 	filp->private_data = rb;
-
-	mutex_lock(&rb->lock);
-	rb->open_count++;
-	mutex_unlock(&rb->lock);
+	atomic_inc(&rb->open_count);
 	return 0;
 }
 
@@ -227,9 +258,7 @@ static int ringbuf_release(struct inode *inode, struct file *filp)
 {
 	struct ringbuf_dev *rb = filp->private_data;
 
-	mutex_lock(&rb->lock);
-	rb->open_count--;
-	mutex_unlock(&rb->lock);
+	atomic_dec(&rb->open_count);
 	return 0;
 }
 
@@ -293,17 +322,22 @@ static ssize_t ringbuf_write(struct file *filp, const char __user *ubuf,
 static __poll_t ringbuf_poll(struct file *filp, poll_table *wait)
 {
 	struct ringbuf_dev *rb = filp->private_data;
+	size_t count, size;
 	__poll_t mask = 0;
 
 	poll_wait(filp, &rb->readq, wait);
 	poll_wait(filp, &rb->writeq, wait);
 
-	mutex_lock(&rb->lock);
-	if (rb->count)
+	/*
+	 * Lock-free snapshot: poll must not sleep behind a writer stalled in a
+	 * user copy. Any change after this point is followed by a wakeup.
+	 */
+	count = READ_ONCE(rb->count);
+	size = READ_ONCE(rb->size);
+	if (count)
 		mask |= EPOLLIN | EPOLLRDNORM;
-	if (rb->count < rb->size)
+	if (count < size)
 		mask |= EPOLLOUT | EPOLLWRNORM;
-	mutex_unlock(&rb->lock);
 
 	return mask;
 }
@@ -315,25 +349,27 @@ static long ringbuf_ioctl(struct file *filp, unsigned int cmd,
 	void __user *uarg = (void __user *)arg;
 	struct ringbuf_stats st;
 	u32 newsize;
+	int ret;
 
 	switch (cmd) {
 	case RINGBUF_IOC_GET_STATS:
-		rb_get_stats(rb, &st);
+		ret = rb_get_stats(rb, &st);
+		if (ret)
+			return ret;
 		return copy_to_user(uarg, &st, sizeof(st)) ? -EFAULT : 0;
 
+	/*
+	 * Destroying data and changing the capacity modify the device, so,
+	 * like write(), they need a descriptor opened for writing.
+	 */
 	case RINGBUF_IOC_CLEAR:
-		if (mutex_lock_interruptible(&rb->lock))
-			return -ERESTARTSYS;
-		rb->head = 0;
-		rb->tail = 0;
-		WRITE_ONCE(rb->count, 0);
-		rb->bytes_written = 0;
-		rb->bytes_read = 0;
-		mutex_unlock(&rb->lock);
-		wake_up_interruptible_poll(&rb->writeq, EPOLLOUT | EPOLLWRNORM);
-		return 0;
+		if (!(filp->f_mode & FMODE_WRITE))
+			return -EBADF;
+		return rb_clear(rb);
 
 	case RINGBUF_IOC_RESIZE:
+		if (!(filp->f_mode & FMODE_WRITE))
+			return -EBADF;
 		if (get_user(newsize, (u32 __user *)uarg))
 			return -EFAULT;
 		return rb_resize(rb, newsize);
@@ -356,6 +392,8 @@ static const struct file_operations ringbuf_fops = {
 
 /* ---------------------------------------------------------------------- */
 /* sysfs: /sys/class/ringbuf/ringbufN/{capacity,used,bytes_written,...}    */
+/* Root-only (0400), like the device node: traffic counters of another     */
+/* user's FIFO are not world-readable.                                      */
 
 #define RINGBUF_STAT_ATTR(field)					\
 static ssize_t field##_show(struct device *dev,				\
@@ -363,10 +401,11 @@ static ssize_t field##_show(struct device *dev,				\
 {									\
 	struct ringbuf_stats st;					\
 									\
-	rb_get_stats(dev_get_drvdata(dev), &st);			\
+	if (rb_get_stats(dev_get_drvdata(dev), &st))			\
+		return -EINTR;						\
 	return sysfs_emit(buf, "%llu\n", (unsigned long long)st.field);	\
 }									\
-static DEVICE_ATTR_RO(field)
+static DEVICE_ATTR_ADMIN_RO(field)
 
 RINGBUF_STAT_ATTR(capacity);
 RINGBUF_STAT_ATTR(used);
@@ -387,12 +426,24 @@ ATTRIBUTE_GROUPS(ringbuf);
 /* ---------------------------------------------------------------------- */
 /* Module load / unload                                                     */
 
+/*
+ * Device nodes are root-only. That is also devtmpfs's default, but the
+ * access policy is stated here rather than left to defaults or udev.
+ */
+static char *ringbuf_devnode(const struct device *dev, umode_t *mode)
+{
+	if (mode)
+		*mode = 0600;
+	return NULL;
+}
+
 static int ringbuf_setup(struct ringbuf_dev *rb, unsigned int index)
 {
 	dev_t devt = MKDEV(MAJOR(ringbuf_devt), MINOR(ringbuf_devt) + index);
 	int ret;
 
 	mutex_init(&rb->lock);
+	atomic_set(&rb->open_count, 0);
 	init_waitqueue_head(&rb->readq);
 	init_waitqueue_head(&rb->writeq);
 
@@ -427,7 +478,7 @@ static void ringbuf_teardown(struct ringbuf_dev *rb)
 {
 	device_destroy(ringbuf_class, rb->cdev.dev);
 	cdev_del(&rb->cdev);
-	kvfree(rb->buf);
+	kvfree_sensitive(rb->buf, rb->size);
 	mutex_destroy(&rb->lock);
 }
 
@@ -456,6 +507,7 @@ static int __init ringbuf_init(void)
 		ret = PTR_ERR(ringbuf_class);
 		goto err_region;
 	}
+	ringbuf_class->devnode = ringbuf_devnode;
 
 	ringbuf_devs = kcalloc(ndevices, sizeof(*ringbuf_devs), GFP_KERNEL);
 	if (!ringbuf_devs) {

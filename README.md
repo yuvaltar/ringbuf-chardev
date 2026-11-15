@@ -8,7 +8,9 @@ blocking and non-blocking I/O, `poll`/`select`/`epoll`, signal handling,
 `ioctl` control and sysfs statistics.
 
 Every push boots two real kernels (Ubuntu's 6.8 and 7.0) in QEMU, loads the
-module and runs a 29-test suite against it.
+module and runs a 32-test suite against it, then fuzzes it on a kernel
+built with KASAN, UBSAN, lockdep and kmemleak. The security design, threat
+model and review findings are in [SECURITY.md](SECURITY.md).
 
 ## Features
 
@@ -27,6 +29,10 @@ module and runs a 29-test suite against it.
   `bytes_written`, `bytes_read` and `open_count`.
 - **Module parameters.** `ndevices` (1–16) and `bufsize` (16 B – 1 MiB) are
   validated at load.
+- **Hardened.** Root-only device and counters, destructive ioctls need write
+  access, memcg-accounted allocations, wiped buffers, and no unkillable
+  sleeps even when a writer stalls inside a user copy. See
+  [SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -64,16 +70,44 @@ initramfs, boots the kernel in QEMU (KVM when available) and:
    - resize while a writer is blocked;
    - record atomicity under four concurrent writers;
    - an eight-thread producer/consumer stress test;
+   - the security requirements: unprivileged access is denied, `CLEAR` and
+     `RESIZE` need write access, and a writer stalled on a userfaultfd page
+     cannot block `open`/`poll` or make a stats request unkillable;
 3. checks that `rmmod` is refused while a descriptor is open, and that device
    nodes and sysfs entries are removed afterwards;
 4. fails if the kernel log contains `BUG`, `WARNING` or `Oops`.
 
 CI runs this on both kernels, builds with `-Werror`, and runs
-`checkpatch --strict` and `sparse`.
+`checkpatch --strict`, `sparse`, `cppcheck`, `gcc -fanalyzer` and CodeQL.
 
-`scripts/mutation-test.sh` injects four realistic bugs into the driver
+### Fuzzing
+
+`fuzz/ringbuf_fuzz.c` has two modes. **model** drives random
+open/dup/close/read/write/ioctl/poll/lseek/mmap/fcntl/sysfs operations and
+checks every result against a reference model of the specification, using
+user buffers that are invalid or fault half-way through a copy. **stress**
+runs eight threads on four devices with signals interrupting blocking calls,
+and in a second pass while the module is unloaded and reloaded underneath.
+
+```sh
+make qemu-fuzz                 # on the stock kernel
+make debug-kernel              # KASAN/UBSAN/lockdep/kmemleak/gcov kernel
+make fuzz-debug                # fuzz on it and print driver coverage
+FUZZ_SEED=1234 make qemu-fuzz  # replay a run
+```
+
+CI fuzzes every push, and runs ten times longer every night. When a run
+fails, `scripts/triage.py` extracts and deduplicates the sanitizer reports,
+prints a reproducer command and, if an `ANTHROPIC_API_KEY` secret is set,
+adds an LLM root-cause analysis mapped to the security requirements.
+
+### Mutation testing
+
+`scripts/mutation-test.sh` injects 14 bugs into a copy of the driver
 (non-atomic writes, a missing wakeup, a stale wait condition, data loss on
-`EFAULT`) and checks that the suite catches each one.
+`EFAULT`, off-by-one capacity checks, and one violation of each security
+requirement) and checks that the tests catch each one. `MODE=fuzz` runs
+the fuzzer instead of the suite.
 
 ## Design notes
 
@@ -100,10 +134,17 @@ CI runs this on both kernels, builds with `-Werror`, and runs
 ```
 driver/ringbuf.c             kernel module
 include/uapi/ringbuf_ioctl.h ioctl ABI shared with user space
-tests/test_ringbuf.c         user-space test suite (29 tests)
+tests/test_ringbuf.c         user-space test suite (32 tests)
 tools/ringbufctl.c           CLI for stats, clear and resize
-scripts/qemu-test.sh         boots a kernel in QEMU and runs everything
+fuzz/ringbuf_fuzz.c          model-based and concurrent fuzzer
+fuzz/kernel/debug.config     sanitizer kernel config fragment
+scripts/qemu-test.sh         boots a kernel in QEMU and runs the tests
+scripts/qemu-fuzz.sh         boots a kernel in QEMU and fuzzes the driver
+scripts/build-debug-kernel.sh builds the sanitizer kernel
+scripts/coverage-report.sh   gcov report from a fuzzing run
 scripts/mutation-test.sh     checks the tests catch injected bugs
+scripts/triage.py            failure triage, optional LLM analysis
+SECURITY.md                  threat model, requirements, findings
 ```
 
 ## License

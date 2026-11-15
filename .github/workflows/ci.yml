@@ -3,6 +3,12 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 2 * * *"      # nightly: longer fuzzing run
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -22,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             linux-image-${{ matrix.kernel }} linux-headers-${{ matrix.kernel }} \
-            qemu-system-x86 busybox-static cpio sparse
+            qemu-system-x86 busybox-static cpio sparse cppcheck
           KVER=$(ls /lib/modules | grep -- '-generic$' | sort -V | tail -1)
           sudo chmod 0644 /boot/vmlinuz-$KVER
           echo "KVER=$KVER" >> "$GITHUB_ENV"
@@ -38,12 +44,120 @@ jobs:
       - name: Build module (warnings are errors)
         run: make module KCFLAGS=-Werror
 
-      - name: Static analysis (checkpatch, sparse)
+      - name: Static analysis (checkpatch, sparse, cppcheck, gcc -fanalyzer)
         if: matrix.kernel == 'generic'
         run: make check
 
-      - name: Build tests and tools
-        run: make userspace
+      - name: Build tests, tools and fuzzer
+        run: make userspace fuzzer
 
       - name: Boot kernel in QEMU and run tests
         run: make qemu-test
+
+      - name: Fuzz on the stock kernel (model + stress + reload)
+        run: make qemu-fuzz
+        env:
+          FUZZ_OPS: 200000
+          FUZZ_SECONDS: 30
+
+  sanitizers:
+    name: Fuzz under KASAN/UBSAN/lockdep/kmemleak
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kernel source and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            linux-source-6.8.0 qemu-system-x86 busybox-static cpio \
+            flex bison bc libelf-dev libssl-dev
+          echo "SRC_VER=$(dpkg-query -W -f='${Version}' linux-source-6.8.0)" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Restore sanitizer kernel
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: build/debug-kernel
+          key: debug-kernel-${{ env.SRC_VER }}-${{ hashFiles('fuzz/kernel/debug.config', 'scripts/build-debug-kernel.sh') }}
+
+      - name: Build sanitizer kernel
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: make debug-kernel
+
+      - name: Test suite under sanitizers
+        run: |
+          make -C build/debug-kernel M=$PWD/driver modules
+          make userspace
+          scripts/qemu-test.sh build/debug-kernel/arch/x86/boot/bzImage \
+            driver/ringbuf.ko tests/test_ringbuf tools/ringbufctl
+
+      - name: Fuzz under sanitizers, with coverage
+        run: |
+          make -C build/debug-kernel M=$PWD/driver clean
+          make fuzz-debug 2>&1 | tee fuzz.log
+        env:
+          # Nightly runs go 10x longer.
+          FUZZ_OPS: ${{ github.event_name == 'schedule' && 5000000 || 500000 }}
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 1200 || 120 }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Fuzzing under sanitizers"
+            echo '```'
+            grep -E "^(instrumentation|model:|stress:|module reloaded|no leaks|clean|RESULT|FUZZ FAILURE|FAIL)" fuzz.log || true
+            echo '```'
+            echo "### Driver coverage (gcov)"
+            echo '```'
+            cat build/coverage/summary.txt 2>/dev/null || echo "no coverage data"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: AI triage of failures
+        if: failure()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 scripts/triage.py fuzz.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-results
+          path: |
+            fuzz.log
+            build/coverage/
+
+  codeql:
+    name: CodeQL (security-extended)
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linux-headers-generic
+          echo "KVER=$(ls /lib/modules | grep -- '-generic$' | sort -V | tail -1)" >> "$GITHUB_ENV"
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+
+      - name: Build everything
+        run: make module userspace fuzzer
+
+      - uses: github/codeql-action/analyze@v3
