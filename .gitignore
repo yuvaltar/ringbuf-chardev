@@ -12,3 +12,11 @@
 # User-space binaries
 /tests/test_ringbuf
 /tools/ringbufctl
+/fuzz/ringbuf_fuzz
+
+# Sanitizer kernel, coverage, fuzz logs
+/build/
+*.gcno
+*.gcda
+*.gcov
+fuzz.log

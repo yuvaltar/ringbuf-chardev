@@ -3,6 +3,7 @@
 # exercise load/unload paths, run the test suite and check the kernel log.
 #
 # usage: qemu-test.sh KERNEL_IMAGE ringbuf.ko test_ringbuf ringbufctl
+# env:   TEST_FILTER runs only the tests whose name contains it
 set -euo pipefail
 
 if [[ $# -ne 4 ]]; then
@@ -25,8 +26,11 @@ cp "$MODULE" "$root/ringbuf.ko"
 cp "$TESTS" "$root/test_ringbuf"
 cp "$CTL" "$root/ringbufctl"
 
-cat > "$root/init" <<'EOF'
+cat > "$root/init" <<EOF
 #!/bin/busybox sh
+TEST_FILTER='${TEST_FILTER:-}'
+EOF
+cat >> "$root/init" <<'EOF'
 /bin/busybox --install -s /bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
@@ -69,7 +73,7 @@ got=$(dd if=/dev/ringbuf0 bs=64 count=1 2>/dev/null)
 /ringbufctl /dev/ringbuf0 stats
 
 echo "=== test suite"
-/test_ringbuf || fail "test suite"
+/test_ringbuf $TEST_FILTER || fail "test suite"
 
 echo "=== unload is refused while a descriptor is open"
 exec 3</dev/ringbuf0
@@ -87,7 +91,9 @@ else
 fi
 
 [ $status -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"
-poweroff -f
+# -no-reboot makes QEMU exit on reboot; poweroff needs ACPI, which
+# the minimal debug kernel lacks.
+reboot -f
 EOF
 chmod +x "$root/init"
 
