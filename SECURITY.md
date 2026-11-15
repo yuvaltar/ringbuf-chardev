@@ -103,8 +103,12 @@ qemu-fuzz`). The driver's gcov line and branch coverage is reported for
 every run.
 
 **Results on the fixed driver:** no divergence from the model, no
-sanitizer report and no leak, in every run so far (CI runs 500,000 model
-operations and 2 × 120 s of stress on every push, ten times that nightly). Fuzzing reaches 90% of the
+sanitizer report and no leak in any run so far, including a run under
+all sanitizers of 100,000 model operations, 306,000 concurrent operations
+(5,559 of them interrupted by signals) and 87,000 more while the module
+was being unloaded and reloaded (seed 20261115).
+CI is configured to run 500,000 model operations and 2 × 120 s of stress
+on every push, and ten times that nightly. Fuzzing reaches 90% of the
 driver's lines and 94% of its branches. The lines it does not reach are all
 load-time error paths (allocation and registration failures, invalid module
 parameters); `qemu-test.sh` covers the parameter checks.
